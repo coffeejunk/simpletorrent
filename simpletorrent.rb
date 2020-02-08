@@ -7,8 +7,6 @@ PROTOCOL_IDENTIFIER = "\x13BitTorrent protocol"
 PEER_ID = "CJ-" + SecureRandom.urlsafe_base64(16).to_s[0...17]
 PORT = 6881
 
-Peer = Struct.new(:ip, :port)
-
 def get_peers tf
   response = RestClient.get(tf.announce, params: {
     info_hash: tf.info_hash,
@@ -62,7 +60,7 @@ def tcp_socket peer, tf
   local_port = nil
   timeout = 3
   sock = Socket.tcp(ip, port, local_host, local_port,
-    {connect_timeout: timeout})
+                    {connect_timeout: timeout})
 
   # The length of the protocol identifier, which is always 19 (0x13 in hex)
   # The protocol identifier, called the pstr which is always BitTorrent protocol
@@ -90,25 +88,27 @@ def tcp_socket peer, tf
 
   # read returned handshake
 
-  maxlen = 68 # length of the handshake
   begin
-    result = sock.read_nonblock(maxlen)
+    result = sock.read_nonblock(68) # 68 = length of the handshake
+    # puts result.inspect
   rescue IO::WaitReadable
     IO.select([sock])
     retry
   end
 
-  # puts result.inspect
-
   # validate the returned handshake
 
   raise "Wrong protocol identifier" unless result[0..19] == PROTOCOL_IDENTIFIER
-  puts "Extensions: #{result[20..27].inspect}" # 8 extension bytes
-  raise "Wrong info_hash returned" unless result[28..47] == tf.info_hash
-  peer_id = result[48..67]
-  puts "Peer ID: #{peer_id}"
 
-  # Connections start out choked and not interested.
+  # puts "Extensions: #{result[20..27].inspect}" # 8 extension bytes
+  # Not dealing with extensions for now
+  # http://www.libtorrent.org/extension_protocol.html
+
+  raise "Wrong info_hash returned" unless result[28..47] == tf.info_hash
+  peer.id = result[48..67]
+  puts "Peer ID: #{peer.id}"
+
+  peer.socket = sock
 
   begin
     # we don't have anything downloaded yet, so can skip sending the bitfield
@@ -116,88 +116,84 @@ def tcp_socket peer, tf
     # 4 bytes network order for length, 1 byte for id
     # N, C
 
-    # unchoke peer ?
     # only unchoke if we want to/once we can send blocks?
     # sock.write [1, 1].pack('NC')
 
     # send interested
     # sock.write [1, 2].pack('NC')
-    while true do
-      begin
-        # Length is a 32-bit integer, meaning it’s made out of four bytes
-        # in big-endian order.
-        length = sock.recv(4) # 4 bytes for length of message
-        length = length.unpack1 "N"
+    loop do
+      # Length is a 32-bit integer, meaning it’s made out of four bytes
+      # in big-endian order.
+      length = sock.recv(4) # 4 bytes for length of message
+      length = length.unpack1 "N"
 
-        # 1 byte for message id
-        #length += 1 # ???
-        puts "Received length:\t#{length.inspect}"
+      # 1 byte for message id
+      # length += 1 # ???
+      puts "Received length:\t#{length.inspect}"
 
-        # keep alive
-        if length == 0
-          sock.write [0].pack('N')
+      # keep alive
+      if length == 0
+        sock.write [0].pack("N")
 
-          next
-        end
-
-        result = sock.recv(length)
-        message_id = result[0]
-        payload = result[1..-1] if result.size > 1
-
-        if length == 1 && payload != nil
-          byebug
-        end
-
-        message_id = result.bytes.first
-
-        puts "Received message_id:\t#{message_id.inspect}"
-        puts "Received payload:\t#{payload.inspect}"
-
-        message = Message.new message_id, length, payload
-        puts message.inspect
-        puts
-
-        message_id = nil
-        payload = nil
-        length = nil
-
-        # b = sock.readbyte
-        # print b.inspect
-        # res << b
-      rescue EOFError
-        break
+        next
       end
-    end
 
+      result = sock.recv(length)
+      # payload = result[1..-1] if result.size > 1
+
+      # if length == 1 && payload != nil
+      #   byebug
+      # end
+
+      # message_id = result.bytes.first
+
+      # puts "Received message_id:\t#{message_id.inspect}"
+      # puts "Received payload:\t#{payload.inspect}"
+
+      message = Message.new result.bytes.first, length,
+        (result.size > 1 ? result[1..-1] : nil)
+      puts message.inspect
+
+      case message.id
+      when 0
+        peer.choking = true
+      when 1
+        peer.choking = false
+      when 2
+        peer.interested = true
+      when 3
+        peer.interested = false
+      when 4
+        # TODO: handle have
+      when 5
+        peer.bitfield = message.payload
+      when 6
+        # TODO: handle request
+      when 7
+        # TODO: handle request
+      when 8
+        # TODO: handle cancel
+      end
+
+      puts peer.inspect
+      puts
+    rescue EOFError
+      break
+    end
   rescue IO::WaitReadable
     IO.select([sock])
     retry
   end
 
-
-
-
-  sock
-
-  rescue Errno::ETIMEDOUT, Errno::ECONNRESET, Errno::ECONNREFUSED, EOFError
-    puts "Connection to Peer failed"
-  rescue RangeError
-    puts "Peer sent incorrect length"
-  end
-
-
-# 0 choke
-# 1 unchoke
-# 2 interested
-# 3 not interested
-# 4 have
-# 5 bitfield
-# 6 request
-# 7 piece
-# 8 cancel
+  peer
+rescue Errno::ETIMEDOUT, Errno::ECONNRESET, Errno::ECONNREFUSED, EOFError
+  puts "Connection to Peer failed"
+rescue RangeError
+  puts "Peer sent incorrect length"
+end
 
 class Message
-  TYPES = %w{
+  TYPES = %w[
     choke
     unchoke
     interested
@@ -207,27 +203,46 @@ class Message
     request
     piece
     cancel
-  }
+  ]
 
   attr_reader :id, :length, :payload, :name
 
   def initialize id, length, payload
-    @name = TYPES[id]
-    puts "Invalid Message" unless @name
+    @id = id
+    @name = TYPES[@id]
+    puts "WARN: Invalid Message type #{@id}" unless @name
 
     @length = length
     @payload = payload
+
+    # length == payload length + 1 for type
     unless !@payload || @payload.size + 1 == @length
-      raise "Invalid payload length #{self.inspect}"
+      raise "Invalid payload length #{inspect}"
     end
   end
 end
 
-# class Peer
-#   attr_accessor :ip, :port
-# end
+class Peer
+  attr_reader :ip, :port, :socket
 
-f = File.open "debian-10.2.0-amd64-netinst.iso.torrent"
-tf = TorrentFile.new f
-peers = get_peers tf
-tcp_socket peers.sample, tf
+  attr_accessor :socket, :bitfield, :id
+
+  attr_accessor :chocked, :interested
+  attr_accessor :choking, :interesting
+
+  def initialize ip, port
+    @ip = ip
+    @port = port
+
+    # Connections start out choked and not interested.
+    @peer.chocked = true
+    @peer.choking = true
+    @peer.interested  = false
+    @peer.interesting = false
+  end
+end
+
+# f = File.open "debian-10.2.0-amd64-netinst.iso.torrent"
+# tf = TorrentFile.new f
+# peers = get_peers tf
+# tcp_socket peers.sample, tf
