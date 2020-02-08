@@ -59,6 +59,9 @@ class Bencode
 
     while peek(s) != "e"
       (key = load(s)) || raise("DecodeError: No key for dict")
+      unless key.is_a?(String) || key.is_a?(Integer)
+        raise "DecodeError: Dict key must be string or int"
+      end
       value = load(s)
       hsh[key] = value
     end
