@@ -1,12 +1,3 @@
-require "rest-client"
-require "securerandom"
-
-require "./torrent_file"
-
-PROTOCOL_IDENTIFIER = "\x13BitTorrent protocol"
-PEER_ID = "CJ-" + SecureRandom.urlsafe_base64(16).to_s[0...17]
-PORT = 6881
-
 def get_peers tf
   response = RestClient.get(tf.announce, params: {
     info_hash: tf.info_hash,
@@ -58,7 +49,7 @@ def tcp_socket peer, tf
   port = peer.port
   local_host = nil
   local_port = nil
-  timeout = 3
+  timeout = 5
   sock = Socket.tcp(ip, port, local_host, local_port,
                     {connect_timeout: timeout})
 
@@ -120,7 +111,8 @@ def tcp_socket peer, tf
     # sock.write [1, 1].pack('NC')
 
     # send interested
-    # sock.write [1, 2].pack('NC')
+    sock.write [1, 2].pack('NC')
+
     loop do
       # Length is a 32-bit integer, meaning it’s made out of four bytes
       # in big-endian order.
@@ -138,20 +130,10 @@ def tcp_socket peer, tf
         next
       end
 
+      result = nil
       result = sock.recv(length)
-      # payload = result[1..-1] if result.size > 1
 
-      # if length == 1 && payload != nil
-      #   byebug
-      # end
-
-      # message_id = result.bytes.first
-
-      # puts "Received message_id:\t#{message_id.inspect}"
-      # puts "Received payload:\t#{payload.inspect}"
-
-      message = Message.new result.bytes.first, length,
-        (result.size > 1 ? result[1..-1] : nil)
+      message = Message.new length, result
       puts message.inspect
 
       case message.id
@@ -159,18 +141,20 @@ def tcp_socket peer, tf
         peer.choking = true
       when 1
         peer.choking = false
+        # XXX:
+        return peer
       when 2
         peer.interested = true
       when 3
         peer.interested = false
       when 4
-        # TODO: handle have
+        peer.have_piece message.payload
       when 5
         peer.bitfield = message.payload
       when 6
         # TODO: handle request
       when 7
-        # TODO: handle request
+        # TODO: handle piece / block
       when 8
         # TODO: handle cancel
       end
@@ -186,63 +170,103 @@ def tcp_socket peer, tf
   end
 
   peer
-rescue Errno::ETIMEDOUT, Errno::ECONNRESET, Errno::ECONNREFUSED, EOFError
+rescue Errno::ETIMEDOUT, Errno::ECONNRESET, Errno::ECONNREFUSED,
+  Errno::EADDRNOTAVAIL, EOFError
   puts "Connection to Peer failed"
 rescue RangeError
   puts "Peer sent incorrect length"
 end
 
-class Message
-  TYPES = %w[
-    choke
-    unchoke
-    interested
-    not\ interested
-    have
-    bitfield
-    request
-    piece
-    cancel
-  ]
+def download_piece tf, peer
+  piece = tf.request_piece peer.bitfield
 
-  attr_reader :id, :length, :payload, :name
+  begin
+    loop do
+      block = piece.request_block
 
-  def initialize id, length, payload
-    @id = id
-    @name = TYPES[@id]
-    puts "WARN: Invalid Message type #{@id}" unless @name
+      if block.nil?
+        if piece.corrupt_blocks.size > 0
+          piece.invalidate_corrupt_blocks
+          puts "INFO: invalidated corrupt blocks; try downloading blocks again"
 
-    @length = length
-    @payload = payload
+          next
+        end
 
-    # length == payload length + 1 for type
-    unless !@payload || @payload.size + 1 == @length
-      raise "Invalid payload length #{inspect}"
+        if piece.validate!
+          puts "Piece #{piece.index_10} downloaded and validated"
+        else
+          puts "WARN: Piece #{piece.index_10} validation FAILED. Discarding blocks."
+        end
+
+        return
+      end
+
+      download_block tf, peer, piece, block
+    end
+  rescue => e
+    puts "Exception: #{e.message}"
+    piece.invalidate!
+  end
+end
+
+# message type consists of
+# - 4-byte message length
+# - 1-byte message ID
+# a payload composed of
+# - 4-byte piece index (0 based)
+# - 4-byte block offset
+# - 4-byte block length
+# within the piece (measured in bytes), and 4-byte block length
+def download_block tf, peer, piece, block
+  payload = "#{piece.index}#{block.offset}#{[TorrentFile::REQUEST_LENGTH].pack("N*")}"
+  request = "#{[1 + payload.bytesize].pack("N")}#{[6].pack("C")}#{payload}"
+
+  peer.socket.write request
+
+  puts "Requested Piece #{piece.index_10} block #{block.index}"
+
+  loop do
+    begin
+      length = peer.socket.recv(4) # 4 bytes for length of message
+      length = length.unpack1 "N"
+
+      next unless length # nil
+
+      # 1 byte for message id
+      # length += 1 # ???
+      puts "Received length:\t#{length.inspect}"
+
+      # keep alive
+      if length == 0
+        peer.socket.write [0].pack("N")
+
+        next
+      end
+
+      result = peer.socket.read_with_timeout(length, 8)
+
+      message = Message.new length, result
+
+      # puts message.inspect
+
+      case message.name
+      when 'piece'
+        piece_idx = message.index
+        block_idx = TorrentFile::Block.find_index(message.offset)
+
+        tf.pieces[piece_idx].blocks[block_idx].receive(message.data)
+        # puts block.inspect
+
+        unless block.have
+          block.invalidate!
+        end
+
+        return
+      end
+    rescue RuntimeError => e
+      puts e.message
+      block.invalidate!
+      return
     end
   end
 end
-
-class Peer
-  attr_reader :ip, :port, :socket
-
-  attr_accessor :socket, :bitfield, :id
-
-  attr_accessor :chocked, :interested
-  attr_accessor :choking, :interesting
-
-  def initialize ip, port
-    @ip = ip
-    @port = port
-
-    # Connections start out choked and not interested.
-    @peer.chocked = true
-    @peer.choking = true
-    @peer.interested  = false
-    @peer.interesting = false
-  end
-end
-
-# f = File.open "debian-10.2.0-amd64-netinst.iso.torrent"
-# tf = TorrentFile.new f
-# peers = get_peers tf
-# tcp_socket peers.sample, tf
