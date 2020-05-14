@@ -1,4 +1,8 @@
-A very incomplete bittorrent implementation in ruby.
+# A very incomplete bittorrent implementation in ruby.
+
+`ruby run.rb` will download `debian-10.3.0-amd64-netinst.iso.torrent`
+
+This is _very, very_ work in progress.
 
 TODO:
 
